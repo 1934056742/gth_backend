@@ -1,0 +1,8 @@
+node_modules
+# Keep environment variables out of version control
+.env
+
+/generated/prisma
+# 大文件上传的分片与最终文件（运行时数据，不入库）
+/uploads
+

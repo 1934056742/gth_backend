@@ -1,0 +1,135 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int     @id @default(autoincrement())
+  account   String  @unique
+  password  String
+  username  String?  
+  age       Int?    
+  email     String?  
+  role      String   @default("member") 
+  /// 是否必须先改密码：新建成员 / 管理员重置密码后置 true，本人改过密码后置 false
+  /// 登录时据此提示「你还在用初始密码，请尽快修改」
+  mustChangePassword Boolean @default(false)
+  createdAt DateTime @default(now())
+  tasks     Task[]
+  aiConversations AiConversation[]
+  /// 上传到 AI 知识库的文档
+  knowledgeDocs KnowledgeDoc[]
+  /// 刷新 token：一个用户最多一条（userId 唯一）
+  refreshToken RefreshToken?
+}
+
+/// 刷新 token 记录（双 token 方案）
+/// 设计要点：
+///   1. userId 加 @unique —— 数据库层面就保证「一人只有一条刷新 token」，
+///      每次登录先删旧记录再建新的，多端同时登录时以最后一次为准（后登录挤掉先登录）；
+///   2. tokenHash 存的是 sha256，不存明文 —— 即使数据库泄露也拿不到可用的 token；
+///   3. expiresAt 用于 7 天有效期校验，过期记录在刷新时顺手清掉。
+model RefreshToken {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// 刷新 token 的 sha256 十六进制摘要（不存明文）
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model Task {
+  id          Int      @id @default(autoincrement())
+  title       String
+  description String @default("")
+  status    String   @default("todo")
+  priority  String   @default("medium")
+  createdAt DateTime @default(now())
+  userId    Int?
+  user      User?     @relation(fields: [userId], references: [id],onDelete:SetNull)
+  completedPerson String?
+}
+
+/// 文件分类：名称唯一（数据库中加 @unique，接口层也会先查重给出友好提示）
+model FileCategory {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  createdAt DateTime @default(now())
+}
+
+/// AI 答疑会话：一个用户可以有多个会话，members 里只有本人
+/// 注意：按用户维度分页查询，所以对 userId + updatedAt 建联合索引
+model AiConversation {
+  id            Int      @id @default(autoincrement())
+  userId        Int
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title         String   @default("新对话")
+  createdAt     DateTime @default(now())
+  /// 最后一条消息的时间：列表按它倒序，相当于「最近活跃」
+  updatedAt     DateTime @default(now())
+  messages      AiMessage[]
+
+  @@index([userId, updatedAt])
+}
+
+/// AI 答疑消息：role 取 user / assistant 对应着问答，conversationId 外键级联删除
+model AiMessage {
+  id             Int            @id @default(autoincrement())
+  conversationId Int
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String
+  content        String         @db.Text
+  createdAt      DateTime       @default(now())
+
+  @@index([conversationId, id])
+}
+
+/// 知识库文档（RAG）：用户上传的资料文件，切块后供 AI 答疑检索。
+/// 设计要点：
+///   1. 与「文件上传」页的文件互不影响：那是一般附件，这里是喂给 AI 的资料；
+///   2. 正文全文存 content（而不是只存切块）：切块是派生的，重建索引时不必再解析原文件；
+///   3. chunkCount 冗余存一份，列表页不必 count 子表；
+///   4. 用户被删除时级联删除文档与切块，不留孤儿数据。
+model KnowledgeDoc {
+  id         Int              @id @default(autoincrement())
+  /// 归属用户：只有上传者本人（和管理员）能删除
+  ownerId    Int
+  owner      User             @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  fileName   String
+  fileSize   Int              @default(0)
+  /// 解析后的纯文本全文
+  content    String           @db.Text
+  /// 文本长度（字符数），用于列表展示与排查解析质量
+  charCount  Int              @default(0)
+  chunkCount Int              @default(0)
+  createdAt  DateTime         @default(now())
+  chunks     KnowledgeChunk[]
+
+  @@index([ownerId, createdAt])
+}
+
+/// 知识库切块：检索的最小单位。
+/// 存原文 + 分词后的词条（空格分隔），BM25 检索时直接读 tokens 做词频统计，
+/// 避免每次提问都重新分词（文档多时这是最耗 CPU 的一步）。
+model KnowledgeChunk {
+  id      Int          @id @default(autoincrement())
+  docId   Int
+  doc     KnowledgeDoc @relation(fields: [docId], references: [id], onDelete: Cascade)
+  /// 在文档内的序号，从 0 开始，用于「第几段」展示与排序
+  seq     Int
+  content String       @db.Text
+  /// 分词结果（空格分隔），检索时用
+  tokens  String       @db.Text
+  /// 词条数：BM25 的文档长度归一化要用，预先算好避免检索时再 split
+  tokenCount Int       @default(0)
+
+  @@index([docId, seq])
+}
+
